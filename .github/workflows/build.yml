@@ -1,1 +1,411 @@
+name: Build Jarvis APK
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Create project files
+        run: |
+          cat > Jarvis/settings.gradle.kts <<'JARVIS_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "Jarvis"
+          include(":app")
+          JARVIS_EOF
+          cat > Jarvis/build.gradle.kts <<'JARVIS_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          JARVIS_EOF
+          cat > Jarvis/gradle.properties <<'JARVIS_EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx3g
+          JARVIS_EOF
+          mkdir -p Jarvis/app
+          cat > Jarvis/app/build.gradle.kts <<'JARVIS_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.jarvis.assistant"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.jarvis.assistant"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("net.java.dev.jna:jna:5.13.0@aar")
+              implementation("com.alphacephei:vosk-android:0.3.47")
+              implementation("androidx.core:core-ktx:1.13.1")
+          }
+          JARVIS_EOF
+          mkdir -p Jarvis/app/src/main
+          cat > Jarvis/app/src/main/AndroidManifest.xml <<'JARVIS_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+              <!-- NOTE: there is deliberately NO INTERNET permission. Android itself
+                   blocks this app from sending any data over the network. -->
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.CALL_PHONE" />
+              <uses-permission android:name="android.permission.READ_CONTACTS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Jarvis"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".JarvisService"
+                      android:exported="false"
+                      android:foregroundServiceType="microphone" />
+              </application>
+          </manifest>
+          JARVIS_EOF
+          mkdir -p Jarvis/app/src/main/java/com/jarvis/assistant
+          cat > Jarvis/app/src/main/java/com/jarvis/assistant/MainActivity.kt <<'JARVIS_EOF'
+          package com.jarvis.assistant
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val info = TextView(this).apply {
+                      text = "Jarvis, at your service.\n\nTap Start, allow the permissions, then say \"Jarvis\"."
+                      textSize = 18f
+                      setPadding(48, 120, 48, 48)
+                  }
+                  val start = Button(this).apply { text = "Start Jarvis"; setOnClickListener { begin() } }
+                  val stop = Button(this).apply {
+                      text = "Stop Jarvis"
+                      setOnClickListener { stopService(Intent(this@MainActivity, JarvisService::class.java)) }
+                  }
+                  setContentView(LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      addView(info); addView(start); addView(stop)
+                  })
+              }
+
+              private fun begin() {
+                  requestPermissions(
+                      arrayOf(
+                          Manifest.permission.RECORD_AUDIO,
+                          Manifest.permission.CALL_PHONE,
+                          Manifest.permission.READ_CONTACTS,
+                          Manifest.permission.POST_NOTIFICATIONS
+                      ), 1
+                  )
+              }
+
+              override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, res: IntArray) {
+                  super.onRequestPermissionsResult(code, perms, res)
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) return
+                  // Needed so Jarvis can open apps/YouTube while you are in another app
+                  if (!Settings.canDrawOverlays(this)) {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                      return
+                  }
+                  startForegroundService(Intent(this, JarvisService::class.java))
+              }
+          }
+          JARVIS_EOF
+          mkdir -p Jarvis/app/src/main/java/com/jarvis/assistant
+          cat > Jarvis/app/src/main/java/com/jarvis/assistant/JarvisService.kt <<'JARVIS_EOF'
+          package com.jarvis.assistant
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.media.AudioFormat
+          import android.media.AudioRecord
+          import android.media.MediaRecorder
+          import android.os.IBinder
+          import android.speech.tts.TextToSpeech
+          import androidx.core.app.NotificationCompat
+          import androidx.core.app.ServiceCompat
+          import org.json.JSONObject
+          import org.vosk.Model
+          import org.vosk.Recognizer
+          import java.io.File
+          import java.util.Locale
+
+          class JarvisService : Service(), TextToSpeech.OnInitListener {
+
+              companion object {
+                  const val WAKE_WORD = "jarvis"   // change here if you want another name
+                  const val RATE = 16000
+              }
+
+              @Volatile private var running = false
+              private var tts: TextToSpeech? = null
+              private lateinit var actions: Actions
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  actions = Actions(this)
+                  tts = TextToSpeech(this, this)
+              }
+
+              override fun onInit(status: Int) {
+                  if (status == TextToSpeech.SUCCESS) tts?.language = Locale("en", "IN")
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("jarvis", "Jarvis", NotificationManager.IMPORTANCE_LOW))
+                  val n: Notification = NotificationCompat.Builder(this, "jarvis")
+                      .setContentTitle("Jarvis is listening for \"$WAKE_WORD\"")
+                      .setContentText("Everything runs offline on this phone.")
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setOngoing(true)
+                      .build()
+                  ServiceCompat.startForeground(this, 1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                  if (!running) {
+                      running = true
+                      Thread { loop() }.start()
+                  }
+                  return START_STICKY
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  tts?.shutdown()
+                  super.onDestroy()
+              }
+
+              // ---------- main listening loop ----------
+              private fun loop() {
+                  try {
+                      val en = Model(modelPath("model-en"))
+                      val hi = Model(modelPath("model-hi"))
+                      val wake = Recognizer(en, RATE.toFloat(), "[\"$WAKE_WORD\", \"[unk]\"]")
+                      val size = maxOf(
+                          AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT), 4096
+                      )
+                      val rec = AudioRecord(
+                          MediaRecorder.AudioSource.VOICE_RECOGNITION, RATE,
+                          AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, size * 2
+                      )
+                      val buf = ByteArray(4096)
+                      rec.startRecording()
+                      while (running) {
+                          val n = rec.read(buf, 0, buf.size)
+                          if (n <= 0) continue
+                          val heard = if (wake.acceptWaveForm(buf, n)) field(wake.result, "text")
+                                      else field(wake.partialResult, "partial")
+                          if (heard.contains(WAKE_WORD)) {
+                              wake.reset()
+                              handleCommand(rec, en, hi, buf)
+                              wake.reset()
+                          }
+                      }
+                      rec.stop(); rec.release()
+                  } catch (e: Exception) {
+                      say("I'm afraid something went wrong, sir.", false)
+                  }
+              }
+
+              private fun handleCommand(rec: AudioRecord, en: Model, hi: Model, buf: ByteArray) {
+                  rec.stop()                       // don't listen to my own voice
+                  say("Yes, sir?", false)
+                  rec.startRecording()
+                  val r1 = Recognizer(en, RATE.toFloat())
+                  val r2 = Recognizer(hi, RATE.toFloat())
+                  val end = System.currentTimeMillis() + 8000
+                  var done = false
+                  while (running && !done && System.currentTimeMillis() < end) {
+                      val n = rec.read(buf, 0, buf.size)
+                      if (n <= 0) continue
+                      val a = r1.acceptWaveForm(buf, n)
+                      val b = r2.acceptWaveForm(buf, n)
+                      if (a || b) done = true
+                  }
+                  rec.stop()
+                  val texts = listOf(field(r1.finalResult, "text"), field(r2.finalResult, "text"))
+                  r1.close(); r2.close()
+                  val (reply, isHindi) = actions.handle(texts)
+                  say(reply, isHindi)
+                  rec.startRecording()
+              }
+
+              // ---------- helpers ----------
+              private fun field(json: String, key: String) = JSONObject(json).optString(key, "")
+
+              private fun say(text: String, hindi: Boolean) {
+                  tts?.language = if (hindi) Locale("hi", "IN") else Locale("en", "IN")
+                  tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "u")
+                  Thread.sleep(300)
+                  while (tts?.isSpeaking == true) Thread.sleep(100)
+              }
+
+              private fun copyAssets(path: String, out: File) {
+                  val list = assets.list(path) ?: return
+                  if (list.isEmpty()) {
+                      out.parentFile?.mkdirs()
+                      assets.open(path).use { i -> out.outputStream().use { o -> i.copyTo(o) } }
+                  } else {
+                      out.mkdirs()
+                      list.forEach { copyAssets("$path/$it", File(out, it)) }
+                  }
+              }
+
+              private fun modelPath(name: String): String {
+                  val dir = File(filesDir, name)
+                  if (!File(dir, ".ok").exists()) {
+                      dir.deleteRecursively()
+                      copyAssets(name, dir)
+                      File(dir, ".ok").createNewFile()
+                  }
+                  return dir.absolutePath
+              }
+          }
+          JARVIS_EOF
+          mkdir -p Jarvis/app/src/main/java/com/jarvis/assistant
+          cat > Jarvis/app/src/main/java/com/jarvis/assistant/Actions.kt <<'JARVIS_EOF'
+          package com.jarvis.assistant
+
+          import android.Manifest
+          import android.app.SearchManager
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.provider.ContactsContract
+          import android.provider.MediaStore
+
+          /** Turns a spoken sentence (English or Hindi) into a phone action. Returns (butler reply, isHindi). */
+          class Actions(private val ctx: Context) {
+
+              // Apps Jarvis must never open
+              private val blocked = listOf(
+                  "bank", "upi", "paytm", "phonepe", "gpay", "google pay", "bhim", "wallet",
+                  "sbi", "hdfc", "icici", "axis", "kotak", "netbanking", "pay", "à¤¬à¥ˆà¤‚à¤•"
+              )
+
+              fun handle(texts: List<String>): Pair<String, Boolean> {
+                  for (t in texts) {
+                      val s = t.lowercase().trim()
+                      if (s.isEmpty()) continue
+                      val hi = s.any { it in '\u0900'..'\u097F' }
+                      route(s, hi)?.let { return it to hi }
+                  }
+                  return "My apologies, sir, I didn't catch that." to false
+              }
+
+              private fun has(s: String, vararg k: String) = k.any { s.contains(it) }
+              private fun strip(s: String, words: List<String>) =
+                  s.split(" ").filter { it.isNotBlank() && it !in words }.joinToString(" ")
+
+              private fun go(i: Intent): Boolean = try {
+                  ctx.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); true
+              } catch (e: Exception) { false }
+
+              private fun route(s: String, hi: Boolean): String? {
+                  val ok = if (hi) "à¤œà¥€, à¤…à¤­à¥€ à¤•à¤°à¤¤à¤¾ à¤¹à¥‚à¤à¥¤" else "Right away, sir."
+                  val fail = if (hi) "à¤®à¤¾à¤«à¤¼ à¤•à¥€à¤œà¤¿à¤, à¤¯à¤¹ à¤¨à¤¹à¥€à¤‚ à¤¹à¥‹ à¤ªà¤¾à¤¯à¤¾à¥¤" else "I'm afraid I couldn't do that, sir."
+
+                  if (has(s, "call", "dial", "à¤•à¥‰à¤²", "à¤«à¥‹à¤¨", "à¤«à¤¼à¥‹à¤¨")) {
+                      val name = strip(s, listOf("call", "dial", "phone", "to", "à¤•à¥‰à¤²", "à¤«à¥‹à¤¨", "à¤«à¤¼à¥‹à¤¨", "à¤•à¥‹", "à¤•à¤°à¥‹", "à¤²à¤—à¤¾à¤“", "à¤•à¤°"))
+                      if (name.isEmpty()) return "Whom shall I call, sir?"
+                      if (ctx.checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED)
+                          return "I need contacts permission first, sir."
+                      val num = findNumber(name) ?: return "I couldn't find $name in your contacts, sir."
+                      return if (go(Intent(Intent.ACTION_CALL, Uri.parse("tel:" + Uri.encode(num))))) "Calling $name now, sir." else fail
+                  }
+
+                  if (has(s, "youtube", "à¤¯à¥‚à¤Ÿà¥à¤¯à¥‚à¤¬")) {
+                      val q = strip(s, listOf("youtube", "à¤¯à¥‚à¤Ÿà¥à¤¯à¥‚à¤¬", "open", "play", "on", "search", "à¤ªà¤°", "à¤–à¥‹à¤²à¥‹", "à¤šà¤²à¤¾à¤“", "à¤¬à¤œà¤¾à¤“", "à¤¸à¤°à¥à¤š", "à¤•à¤°à¥‹", "à¤®à¥‡à¤‚"))
+                      val i = if (q.isEmpty()) ctx.packageManager.getLaunchIntentForPackage("com.google.android.youtube")
+                              else Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/results?search_query=" + Uri.encode(q)))
+                      return if (i != null && go(i)) ok else fail
+                  }
+
+                  if (has(s, "open", "launch", "à¤–à¥‹à¤²à¥‹", "à¤–à¥‹à¤²", "à¤“à¤ªà¤¨")) {
+                      val name = strip(s, listOf("open", "launch", "the", "app", "à¤–à¥‹à¤²à¥‹", "à¤–à¥‹à¤²", "à¤“à¤ªà¤¨", "à¤•à¤°à¥‹", "à¤à¤ª", "à¤à¤ª"))
+                      return openApp(name, ok, fail)
+                  }
+
+                  if (has(s, "search", "google", "à¤¸à¤°à¥à¤š", "à¤–à¥‹à¤œà¥‹", "à¤¢à¥‚à¤‚à¤¢à¥‹", "à¤¢à¥‚à¤‚à¤¢")) {
+                      val q = strip(s, listOf("search", "google", "for", "on", "à¤¸à¤°à¥à¤š", "à¤–à¥‹à¤œà¥‹", "à¤¢à¥‚à¤‚à¤¢à¥‹", "à¤¢à¥‚à¤‚à¤¢", "à¤•à¤°à¥‹", "à¤•à¥‡", "à¤¬à¤¾à¤°à¥‡", "à¤®à¥‡à¤‚"))
+                      return if (go(Intent(Intent.ACTION_WEB_SEARCH).putExtra(SearchManager.QUERY, q))) ok else fail
+                  }
+
+                  if (has(s, "play", "song", "music", "à¤—à¤¾à¤¨à¤¾", "à¤—à¤¾à¤¨à¥‡", "à¤šà¤²à¤¾à¤“", "à¤¬à¤œà¤¾à¤“")) {
+                      val q = strip(s, listOf("play", "song", "music", "me", "a", "the", "à¤—à¤¾à¤¨à¤¾", "à¤—à¤¾à¤¨à¥‡", "à¤šà¤²à¤¾à¤“", "à¤¬à¤œà¤¾à¤“", "à¤•à¤°à¥‹", "à¤®à¥‡à¤°à¥‡", "à¤²à¤¿à¤"))
+                      val i = Intent(MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH)
+                          .putExtra(SearchManager.QUERY, q)
+                          .putExtra(MediaStore.EXTRA_MEDIA_FOCUS, "vnd.android.cursor.item/*")
+                      return if (go(i)) ok else fail
+                  }
+                  return null
+              }
+
+              private fun findNumber(name: String): String? {
+                  ctx.contentResolver.query(
+                      ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                      arrayOf(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME, ContactsContract.CommonDataKinds.Phone.NUMBER),
+                      null, null, null
+                  )?.use { c ->
+                      while (c.moveToNext()) {
+                          if (c.getString(0).lowercase().contains(name)) return c.getString(1)
+                      }
+                  }
+                  return null
+              }
+
+              private fun openApp(name: String, ok: String, fail: String): String {
+                  if (name.isEmpty()) return "Which app, sir?"
+                  val pm = ctx.packageManager
+                  val apps = pm.quer
